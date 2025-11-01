@@ -8,10 +8,10 @@ using Signaling;
 /// <summary>
 /// Represents a proxy for managing processes
 /// </summary>
-/// <param name="_info">The information used for starting the process</param>
-/// <param name="_maxErrors">The maximum number of errors to track</param>
+/// <param name="startInfo">The information used for starting the process</param>
+/// <param name="maxErrors">The maximum number of errors to track</param>
 /// <remarks>
-/// <para>The following properties on the <see cref="ProcessStartInfo"/> parameter (<paramref name="_info"/>) will be overwritten:</para>
+/// <para>The following properties on the <see cref="ProcessStartInfo"/> parameter (<paramref name="startInfo"/>) will be overwritten:</para>
 /// <para><see cref="ProcessStartInfo.CreateNoWindow"/> will always be <see langword="true"/></para>
 /// <para><see cref="ProcessStartInfo.RedirectStandardError"/> will always be <see langword="true"/></para>
 /// <para><see cref="ProcessStartInfo.RedirectStandardInput"/> will always be <see langword="true"/></para>
@@ -19,9 +19,10 @@ using Signaling;
 /// <para><see cref="ProcessStartInfo.WindowStyle"/> will always be <see cref="ProcessWindowStyle.Hidden"/></para>
 /// </remarks>
 public class ProcessProxy(
-	ProcessStartInfo _info,
-	int _maxErrors = ProcessProxy.MAX_ERRORS_TRACKED) : TextWriter, IAsyncDisposable, IDisposable
+	ProcessStartInfo startInfo,
+	int maxErrors = ProcessProxy.MAX_ERRORS_TRACKED) : TextWriter, IAsyncDisposable, IDisposable
 {
+	#region Constants
 	/// <summary>
 	/// The maximum number of errors to track by default
 	/// </summary>
@@ -46,17 +47,14 @@ public class ProcessProxy(
 	/// The default encoding to use for all process proxies
 	/// </summary>
 	public static Encoding DefaultEncoding { get; set; } = Encoding.UTF8;
+	#endregion
 
+	#region Fields
 	private readonly Stopwatch _timer = new();
 	private readonly CancellationTokenSource _cancel = new();
 	private readonly SemaphoreSlim _accessControl = new(1, 1);
 	private readonly SemaphoreSlim _cleanControl = new(1, 1);
-	private readonly FixedQueue<ProcessError> _errors = new(_maxErrors);
-	private Process? _process;
-	private Task? _task;
-	private Encoding? _encoding;
-	private string? _logName;
-
+	private readonly FixedQueue<ProcessError> _errors = new(maxErrors);
 	private readonly Subject<string> _standardOutput = new();
 	private readonly Subject<string> _standardError = new();
 	private readonly Subject<int> _started = new();
@@ -68,8 +66,13 @@ public class ProcessProxy(
 	private IObservable<int>? _startedObs;
 	private IObservable<ProcessResult>? _exitedObs;
 	private IObservable<ProcessError>? _exceptionObs;
+	private Process? _process;
+	private Task? _task;
+	private Encoding? _encoding;
+	private string? _logName;
+	#endregion
 
-	#region Events
+	#region Properties
 	/// <summary>
 	/// Triggered whenever a line is received from standard output
 	/// </summary>
@@ -90,9 +93,6 @@ public class ProcessProxy(
 	/// Triggered when an exception occurs during process execution
 	/// </summary>
 	public IObservable<ProcessError> OnException => _exceptionObs ??= _exception.AsObservable();
-	#endregion
-
-	#region Auto Properties
 	/// <summary>
 	/// The amount of time the process has been running
 	/// </summary>
@@ -130,11 +130,11 @@ public class ProcessProxy(
 	/// <summary>
 	/// The name of the file being executed
 	/// </summary>
-	public string FileName => _info.FileName;
+	public string FileName => startInfo.FileName;
 	/// <summary>
 	/// The arguments being passed to the executable
 	/// </summary>
-	public string Arguments => string.IsNullOrEmpty(_info.Arguments) ? string.Join(' ', _info.ArgumentList) : _info.Arguments;
+	public string Arguments => string.IsNullOrEmpty(startInfo.Arguments) ? string.Join(' ', startInfo.ArgumentList) : startInfo.Arguments;
 	/// <inheritdoc />
 	public override Encoding Encoding => _encoding ??= DefaultEncoding;
 	/// <summary>
@@ -171,7 +171,7 @@ public class ProcessProxy(
     /// <returns>The current proxy for method chaining</returns>
     public ProcessProxy WithWorkingDirectory(string? directory)
 	{
-		_info.WorkingDirectory = directory ?? string.Empty;
+		startInfo.WorkingDirectory = directory ?? string.Empty;
 		return this;
 	}
 
@@ -182,7 +182,7 @@ public class ProcessProxy(
 	/// <returns>The current proxy for method chaining</returns>
 	public ProcessProxy WithArgs(string? arguments)
 	{
-		_info.Arguments = arguments ?? string.Empty;
+		startInfo.Arguments = arguments ?? string.Empty;
 		return this;
 	}
 
@@ -191,7 +191,7 @@ public class ProcessProxy(
 	{
 		foreach (var arg in arguments)
 			if (!string.IsNullOrWhiteSpace(arg))
-				_info.ArgumentList.Add(arg);
+				startInfo.ArgumentList.Add(arg);
 		return this;
 	}
 
@@ -202,7 +202,7 @@ public class ProcessProxy(
 	/// <returns>The current proxy for method chaining</returns>
 	public ProcessProxy WithUser(string? username)
 	{
-		_info.UserName = username ?? string.Empty;
+		startInfo.UserName = username ?? string.Empty;
 		return this;
 	}
 
@@ -214,7 +214,7 @@ public class ProcessProxy(
 	/// <returns>The current proxy for method chaining</returns>
 	public ProcessProxy WithEnvArg(string key, string? value)
 	{
-		_info.Environment[key] = value;
+		startInfo.Environment[key] = value;
 		return this;
 	}
 
@@ -336,7 +336,7 @@ public class ProcessProxy(
 			EnsureStartArgs();
 			_process = new Process
 			{
-				StartInfo = _info,
+				StartInfo = startInfo,
 				EnableRaisingEvents = true,
 			};
 			_process.OutputDataReceived += (_, args) =>
@@ -995,11 +995,11 @@ public class ProcessProxy(
 	/// </summary>
 	internal void EnsureStartArgs()
 	{
-		_info.CreateNoWindow = true;
-		_info.RedirectStandardOutput = true;
-		_info.RedirectStandardError = true;
-		_info.RedirectStandardInput = true;
-		_info.WindowStyle = ProcessWindowStyle.Hidden;
+		startInfo.CreateNoWindow = true;
+		startInfo.RedirectStandardOutput = true;
+		startInfo.RedirectStandardError = true;
+		startInfo.RedirectStandardInput = true;
+		startInfo.WindowStyle = ProcessWindowStyle.Hidden;
 	}
 
 	/// <summary>
