@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="../.gitignore" />
+    <File Path="../LICENSE" />
+    <File Path="../README.md" />
+    <File Path="../test.DockerFile" />
+  </Folder>
+  <Project Path="SteamServerManager.Api/SteamServerManager.Api.csproj" />
+  <Project Path="SteamServerManager.Cli/SteamServerManager.Cli.csproj" Id="77240817-878e-42a9-bc95-3bba349df32f" />
+  <Project Path="SteamServerManager.Core/SteamServerManager.Core.csproj" Id="6b79237d-a9bb-4cfd-bda4-d085128bdf43" />
+  <Project Path="SteamServerManager.Processing/SteamServerManager.Processing.csproj" Id="8f661e92-aab7-41bf-93a8-88a6a8f376ac" />
+</Solution>
