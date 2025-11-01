@@ -91,8 +91,18 @@ internal class ProcessService(
 	public async Task<ProcessResult> Run(ProcessProxy proxy, bool logEvents = true, CancellationToken token = default)
 	{
 		if (logEvents) proxy.WithLogger(_logger);
-		await proxy.WithTracking().Start(token);
-		return await proxy.WaitForResult(CancellationToken.None);
+		var stdOut = new StringBuilder();
+		var stdErr = new StringBuilder();
+		await proxy
+			.WithStandardError(stdErr, out var errDis)
+			.WithStandardOutput(stdOut, out var outDis)
+			.Start(token);
+		var result = await proxy.WaitForResult(CancellationToken.None);
+		result.Output = stdOut.ToString();
+		result.Error = stdErr.ToString();
+		outDis.Dispose();
+		errDis.Dispose();
+		return result;
 	}
 
 	public Task<ProcessResult> PowerShellScript(string script, string? workingDirectory = null, bool logEvents = true, CancellationToken token = default)

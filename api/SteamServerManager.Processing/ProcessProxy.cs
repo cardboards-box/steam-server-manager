@@ -2,7 +2,6 @@
 
 namespace SteamServerManager.Processing;
 
-using Delegates;
 using Exceptions;
 using Signaling;
 
@@ -10,18 +9,23 @@ using Signaling;
 /// Represents a proxy for managing processes
 /// </summary>
 /// <param name="_info">The information used for starting the process</param>
+/// <param name="_maxErrors">The maximum number of errors to track</param>
 /// <remarks>
-/// <para>The following properties on <paramref name="_info"/> parameter will be overwritten:</para>
+/// <para>The following properties on the <see cref="ProcessStartInfo"/> parameter (<paramref name="_info"/>) will be overwritten:</para>
 /// <para><see cref="ProcessStartInfo.CreateNoWindow"/> will always be <see langword="true"/></para>
 /// <para><see cref="ProcessStartInfo.RedirectStandardError"/> will always be <see langword="true"/></para>
 /// <para><see cref="ProcessStartInfo.RedirectStandardInput"/> will always be <see langword="true"/></para>
 /// <para><see cref="ProcessStartInfo.RedirectStandardOutput"/> will always be <see langword="true"/></para>
-/// <para><see cref="ProcessStartInfo.UseShellExecute"/> will always be <see langword="false"/></para>
 /// <para><see cref="ProcessStartInfo.WindowStyle"/> will always be <see cref="ProcessWindowStyle.Hidden"/></para>
 /// </remarks>
 public class ProcessProxy(
-	ProcessStartInfo _info) : TextWriter, IAsyncDisposable
+	ProcessStartInfo _info,
+	int _maxErrors = ProcessProxy.MAX_ERRORS_TRACKED) : TextWriter, IAsyncDisposable, IDisposable
 {
+	/// <summary>
+	/// The maximum number of errors to track by default
+	/// </summary>
+	public const int MAX_ERRORS_TRACKED = 10;
 	/// <summary>
 	/// The file name for executing PowerShell scripts
 	/// </summary>
@@ -46,35 +50,46 @@ public class ProcessProxy(
 	private readonly Stopwatch _timer = new();
 	private readonly CancellationTokenSource _cancel = new();
 	private readonly SemaphoreSlim _accessControl = new(1, 1);
-	private readonly StringBuilder _stdOut = new();
-	private readonly StringBuilder _stdErr = new();
+	private readonly SemaphoreSlim _cleanControl = new(1, 1);
+	private readonly FixedQueue<ProcessError> _errors = new(_maxErrors);
 	private Process? _process;
 	private Task? _task;
 	private Encoding? _encoding;
 	private string? _logName;
-	private readonly FixedQueue<ProcessError> _errors = new(10);
+
+	private readonly Subject<string> _standardOutput = new();
+	private readonly Subject<string> _standardError = new();
+	private readonly Subject<int> _started = new();
+	private readonly BehaviorSubject<ProcessResult> _exited = new(ProcessResult.Default);
+	private readonly Subject<ProcessError> _exception = new();
+
+	private IObservable<string>? _standardOutputObs;
+	private IObservable<string>? _standardErrorObs;
+	private IObservable<int>? _startedObs;
+	private IObservable<ProcessResult>? _exitedObs;
+	private IObservable<ProcessError>? _exceptionObs;
 
 	#region Events
 	/// <summary>
 	/// Triggered whenever a line is received from standard output
 	/// </summary>
-	public event ProcessOutputHandler OnStandardOutput = delegate { };
+	public IObservable<string> OnStandardOutput => _standardOutputObs ??= _standardOutput.AsObservable();
 	/// <summary>
 	/// Triggered whenever a line is received from standard error
 	/// </summary>
-	public event ProcessOutputHandler OnStandardError = delegate { };
+	public IObservable<string> OnStandardError => _standardErrorObs ??= _standardError.AsObservable();
 	/// <summary>
 	/// Triggered when the process has started
 	/// </summary>
-	public event ProcessVoidHandler OnStarted = delegate { };
+	public IObservable<int> OnStarted => _startedObs ??= _started.AsObservable();
 	/// <summary>
 	/// Triggered when the process has exited
 	/// </summary>
-	public event ProcessVoidHandler OnExited = delegate { };
+	public IObservable<ProcessResult> OnExited => _exitedObs ??= _exited.AsObservable().Skip(1);
 	/// <summary>
 	/// Triggered when an exception occurs during process execution
 	/// </summary>
-	public event ProcessErrorHandler OnException = delegate { };
+	public IObservable<ProcessError> OnException => _exceptionObs ??= _exception.AsObservable();
 	#endregion
 
 	#region Auto Properties
@@ -87,16 +102,6 @@ public class ProcessProxy(
 	/// </summary>
 	public bool Cancelled => _cancel.IsCancellationRequested;
 	/// <summary>
-	/// Everything that has been written to standard output
-	/// </summary>
-	/// <remarks>Only available if <see cref="TrackOutput"/> is enabled</remarks>
-	public string StandardOutput => _stdOut.ToString();
-	/// <summary>
-	/// Gets the standard error output captured during the execution of the process.
-	/// </summary>
-	/// <remarks>Only available if <see cref="TrackError"/> is enabled</remarks>
-	public string StandardError => _stdErr.ToString();
-	/// <summary>
 	/// The exit code of the process or -1 if the process has not exited
 	/// </summary>
 	public int ExitCode => _process?.ExitCode ?? -1;
@@ -104,7 +109,7 @@ public class ProcessProxy(
 	/// The writer to the standard input of the process
 	/// </summary>
 	/// <remarks>Only available if <see cref="Running"/> is <see langword="true"/></remarks>
-	public StreamWriter Writer => _process?.StandardInput ?? throw new NotSupportedException("Cannot access a writer for a process that hasn't started");
+	public StreamWriter? Writer => _process?.StandardInput;
 	/// <summary>
 	/// Whether or not the process is currently running
 	/// </summary>
@@ -121,12 +126,7 @@ public class ProcessProxy(
 	/// The result of the process at the current point in time
 	/// </summary>
 	/// <remarks>If the process hasn't exited, the <see cref="ProcessResult.ExitCode"/> will be -1</remarks>
-	public ProcessResult Result => new (
-		_process?.ExitCode ?? -1,
-		StandardOutput,
-		StandardError.ForceNull(),
-		LastError?.Exception,
-		Elapsed);
+	public ProcessResult Result => _exited.Value;
 	/// <summary>
 	/// The name of the file being executed
 	/// </summary>
@@ -137,17 +137,6 @@ public class ProcessProxy(
 	public string Arguments => string.IsNullOrEmpty(_info.Arguments) ? string.Join(' ', _info.ArgumentList) : _info.Arguments;
 	/// <inheritdoc />
 	public override Encoding Encoding => _encoding ??= DefaultEncoding;
-	#endregion
-
-	#region Configuration Properties
-	/// <summary>
-	/// Whether or not to write everything from standard output to <see cref="StandardOutput"/>
-	/// </summary>
-	public bool TrackOutput { get; set; } = false;
-	/// <summary>
-	/// Whether or not to write everything from standard error to <see cref="StandardError"/>
-	/// </summary>
-	public bool TrackError { get; set; } = false;
 	/// <summary>
 	/// The name to use for logging purposes
 	/// </summary>
@@ -156,16 +145,23 @@ public class ProcessProxy(
 		get => _logName ??= FileName;
 		set => _logName = value;
 	}
-    #endregion
+	#endregion
 
-    /// <summary>
-    /// Represents a proxy for managing processes
-    /// </summary>
-    /// <param name="command">The executable to run in the new process</param>
-    public ProcessProxy(string command) : this(new ProcessStartInfo
-	{
-		FileName = command,
-	}) { }
+	/// <summary>
+	/// Represents a proxy for managing processes
+	/// </summary>
+	/// <param name="command">The executable to run in the new process</param>
+	/// <param name="maxErrors">The maximum number of errors to track</param>
+	/// <param name="shellExecute">The value to use for <see cref="ProcessStartInfo.UseShellExecute"/></param>
+	public ProcessProxy(
+		string command,
+		int maxErrors = MAX_ERRORS_TRACKED,
+		bool shellExecute = false) 
+		: this(new ProcessStartInfo 
+		{ 
+			FileName = command, 
+			UseShellExecute = shellExecute
+		}, maxErrors) { }
 
     #region Configuration methods
     /// <summary>
@@ -257,24 +253,59 @@ public class ProcessProxy(
 	{
 		if (!string.IsNullOrEmpty(name))
 			Name = name;
-		OnStandardOutput += (line) => logger.LogInformation("[{ProcessName}::STDOUT] {Line}", Name, line);
-		OnStandardError += (line) => logger.LogWarning("[{ProcessName}::STDERR] {Line}", Name, line);
-		OnException += (code, exception) => logger.LogError(exception, "[{ProcessName}::EXCEPTION] An exception occurred: {ErrorCode}", Name, code);
-		OnExited += () => logger.LogInformation("[{ProcessName}::EXITED] Process has exited.", Name);
-		OnStarted += () => logger.LogInformation("[{ProcessName}::STARTED] Process has started.", Name);
+		OnStandardOutput.Subscribe((line) => logger.LogInformation("[{ProcessName}::STDOUT] {Line}", Name, line));
+		OnStandardError.Subscribe((line) => logger.LogWarning("[{ProcessName}::STDERR] {Line}", Name, line));
+		OnException.Subscribe((error) => logger.LogError(error.Exception, "[{ProcessName}::EXCEPTION] An exception occurred: {ErrorCode}", Name, error.Code));
+		OnExited.Subscribe((res) => logger.LogInformation("[{ProcessName}::EXITED] Process has exited >> {Code} ({Success})", Name, res.ExitCode, res.Success ? "Success" : "Failed"));
+		OnStarted.Subscribe((id) => logger.LogInformation("[{ProcessName}::STARTED] Process has started.", Name));
 		return this;
 	}
 
 	/// <summary>
-	/// Enables or disables tracking standard output and error streams to <see cref="StandardOutput"/> and <see cref="StandardError"/>
+	/// Writes everything from <see cref="OnStandardOutput"/> to the given <see cref="StringBuilder"/>
 	/// </summary>
-	/// <param name="stdOut">Whether or not to track standard output and pipe the results to <see cref="StandardOutput"/></param>
-	/// <param name="stdErr">Whether or not to track standard error and pipe the results to <see cref="StandardError"/></param>
+	/// <param name="builder">The string builder to write to</param>
+	/// <param name="disposer">The subscription's disposable instance</param>
 	/// <returns>The current proxy for method chaining</returns>
-	public ProcessProxy WithTracking(bool stdOut = true, bool stdErr = true)
+	public ProcessProxy WithStandardOutput(StringBuilder builder, out IDisposable disposer)
 	{
-		TrackError = stdErr;
-		TrackOutput = stdOut;
+		disposer = OnStandardOutput.Subscribe((line) => builder.AppendLine(line));
+		return this;
+	}
+
+	/// <summary>
+	/// Writes everything from <see cref="OnStandardOutput"/> to the given <see cref="TextWriter"/>
+	/// </summary>
+	/// <param name="writer">The <see cref="TextWriter"/> to write to</param>
+	/// <param name="disposer">The subscription's disposable instance</param>
+	/// <returns>The current proxy for method chaining</returns>
+	public ProcessProxy WithStandardOutput(TextWriter writer, out IDisposable disposer)
+	{
+		disposer = OnStandardOutput.Subscribe(writer.WriteLine);
+		return this;
+	}
+
+	/// <summary>
+	/// Writes everything from <see cref="OnStandardError"/> to the given <see cref="StringBuilder"/>
+	/// </summary>
+	/// <param name="builder">The string builder to write to</param>
+	/// <param name="disposer">The subscription's disposable instance</param>
+	/// <returns>The current proxy for method chaining</returns>
+	public ProcessProxy WithStandardError(StringBuilder builder, out IDisposable disposer)
+	{
+		disposer = OnStandardError.Subscribe((line) => builder.AppendLine(line));
+		return this;
+	}
+
+	/// <summary>
+	/// Writes everything from <see cref="OnStandardError"/> to the given <see cref="TextWriter"/>
+	/// </summary>
+	/// <param name="writer">The <see cref="TextWriter"/> to write to</param>
+	/// <param name="disposer">The subscription's disposable instance</param>
+	/// <returns>The current proxy for method chaining</returns>
+	public ProcessProxy WithStandardError(TextWriter writer, out IDisposable disposer)
+	{
+		disposer = OnStandardError.Subscribe(writer.WriteLine);
 		return this;
 	}
 	#endregion
@@ -292,7 +323,6 @@ public class ProcessProxy(
 	{
 		var tsc = new TaskCompletionSource();
 		token.Register(() => tsc.TrySetCanceled());
-		void Started() => tsc.TrySetResult();
 
 		try
 		{
@@ -312,22 +342,17 @@ public class ProcessProxy(
 			_process.OutputDataReceived += (_, args) =>
 			{
 				if (string.IsNullOrEmpty(args.Data)) return;
-                OnStandardOutput(args.Data);
-				if (!TrackOutput) return;
-				_stdOut.AppendLine(args.Data);
+                _standardOutput.OnNext(args.Data);
 			};
 			_process.ErrorDataReceived += (_, args) =>
 			{
 				if (string.IsNullOrEmpty(args.Data)) return;
-				OnStandardError(args.Data);
-				if (!TrackError) return;
-				_stdErr.AppendLine(args.Data);
+				_standardError.OnNext(args.Data);
 			};
 
-			OnStarted += Started;
+			using var sub = OnStarted.Subscribe((_) => tsc.TrySetResult());
 			_task = Task.Run(ExecuteThread, CancellationToken.None);
 			await tsc.Task;
-			OnStarted -= Started;
 			return true;
 		}
 		catch (Exception ex)
@@ -374,7 +399,7 @@ public class ProcessProxy(
 			try { return _process!.CloseMainWindow(); }
 			catch (Exception ex)
 			{
-				OnException(ProcessErrorCode.Stop_CloseMainWindow, ex);
+				SetError(ProcessErrorCode.Stop_CloseMainWindow, ex);
 				return false;
 			}
 		}
@@ -403,7 +428,7 @@ public class ProcessProxy(
 		}
 		catch (Exception ex)
 		{
-			OnException(ProcessErrorCode.Stop, ex);
+			SetError(ProcessErrorCode.Stop, ex);
 			return false;
 		}
 		finally
@@ -469,8 +494,6 @@ public class ProcessProxy(
 	/// <param name="token">The cancellation token for the wait operation</param>
 	/// <returns>The result of the process</returns>
 	/// <remarks>
-	/// <para>if <see cref="TrackOutput"/> is <see langword="false"/> then <see cref="ProcessResult.OutputStream"/> will be <see cref="string.Empty"/></para>
-	/// <para>if <see cref="TrackError"/> is <see langword="false"/> then <see cref="ProcessResult.ErrorStream"/> will by <see langword="null"/></para>
 	/// <para><see cref="OperationCanceledException"/> is not thrown when the <paramref name="token"/> is cancelled.</para>
 	/// </remarks>
 	public async Task<ProcessResult> WaitForResult(CancellationToken token = default)
@@ -962,8 +985,9 @@ public class ProcessProxy(
 	/// <param name="ex">The exception that was thrown</param>
 	internal void SetError(ProcessErrorCode code, Exception ex)
 	{
-		_errors.Enqueue(new (code, ex));
-		OnException(code, ex);
+		ProcessError err = new(code, ex);
+		_errors.Enqueue(err);
+		_exception.OnNext(err);
 	}
 
 	/// <summary>
@@ -972,7 +996,6 @@ public class ProcessProxy(
 	internal void EnsureStartArgs()
 	{
 		_info.CreateNoWindow = true;
-		_info.UseShellExecute = false;
 		_info.RedirectStandardOutput = true;
 		_info.RedirectStandardError = true;
 		_info.RedirectStandardInput = true;
@@ -994,7 +1017,7 @@ public class ProcessProxy(
 			_process.BeginErrorReadLine();
 			_process.BeginOutputReadLine();
 
-			OnStarted();
+			_started.OnNext(_process.Id);
 			await _process.WaitForExitAsync(_cancel.Token);
 		}
 		catch (OperationCanceledException) { }
@@ -1004,51 +1027,84 @@ public class ProcessProxy(
 		}
 		finally
 		{
-			CleanProcess();
+			await CleanProcess(CancellationToken.None);
 		}
 	}
 
 	/// <summary>
 	/// Cleans up the resources associated with the process
 	/// </summary>
-	internal void CleanProcess()
+	internal async Task CleanProcess(CancellationToken token)
 	{
-		if (_process is null) return;
-
 		try
 		{
-			_process.CancelErrorRead();
-			_process.CancelOutputRead();
-		}
-		catch { }
+			await _cleanControl.WaitAsync(token);
 
-		if (!_process.HasExited)
-		{
+			if (_process is null) return;
+
 			try
 			{
-				_process.Kill(true);
+				_process.CancelErrorRead();
+				_process.CancelOutputRead();
 			}
 			catch { }
+
+			if (!_process.HasExited)
+			{
+				try
+				{
+					_process.Kill(true);
+				}
+				catch { }
+			}
+			Running = false;
+			_timer.Stop();
+			_exited.OnNext(new(
+				_process.ExitCode,
+				LastError?.Exception,
+				Elapsed));
+			_process.Dispose();
+			_process = null;
 		}
-		Running = false;
-		_timer.Stop();
-		_process.Dispose();
-		_process = null;
-		OnExited();
+		catch (OperationCanceledException) { }
+		finally
+		{
+			_cleanControl.Release();
+		}
 	}
-	#endregion
+
+	/// <inheritdoc />
+	public new void Dispose()
+	{
+		DisposeAsync()
+			.AsTask()
+			.GetAwaiter()
+			.GetResult();
+		base.Dispose();
+		GC.SuppressFinalize(this);
+	}
 
 	/// <inheritdoc />
 	public new async ValueTask DisposeAsync()
 	{
+		await CleanProcess(CancellationToken.None);
+
 		_cancel.Cancel();
 		if (_task != null)
 			await _task;
+
 		_accessControl.Dispose();
+		_cleanControl.Dispose();
 		_cancel.Dispose();
+		_standardOutput.Dispose();
+		_standardError.Dispose();
+		_started.Dispose();
+		_exited.Dispose();
+		_exception.Dispose();
 		await base.DisposeAsync();
 		GC.SuppressFinalize(this);
 	}
+	#endregion
 
 	#region Static helper methods
 	/// <summary>
