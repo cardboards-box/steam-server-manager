@@ -1,6 +1,6 @@
 ﻿namespace SteamServerManager.Processing.Signaling;
 
-internal partial class WindowsConsoleCloser
+internal partial class WindowsConsoleInterop
 {
 	[DllImport("kernel32.dll", SetLastError = true)]
 	static extern bool AttachConsole(uint dwProcessId);

@@ -8,6 +8,10 @@ namespace SteamServerManager.Processing.Signaling;
 public enum Signal
 {
 	/// <summary>
+	/// Represents an unspecified or unrecognized value.
+	/// </summary>
+	Unknown = 0,
+	/// <summary>
 	/// <see cref="Signum.SIGTERM"/> or <see cref="WindowsSignal.CTRL_SHUTDOWN_EVENT"/>
 	/// </summary>
 	Terminate = 1,

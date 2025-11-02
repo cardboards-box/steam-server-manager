@@ -29,7 +29,7 @@ internal class ProcessTestVerb(
 
 	public async Task<bool> NestedTest(CancellationToken token)
 	{
-		var process = GenProxy($"process-test {nameof(WriteTest)}");
+		using var process = GenProxy($"process-test {nameof(WriteTest)}");
 		if (process is null) return false;
 
 		await process.Start(token);
@@ -41,7 +41,7 @@ internal class ProcessTestVerb(
 
 	public async Task<bool> KillTest(CancellationToken token)
 	{
-		var process = GenProxy("long-running");
+		using var process = GenProxy("long-running");
 		if (process is null) return false;
 
 		await process.Start(token);
@@ -61,7 +61,7 @@ internal class ProcessTestVerb(
 
 	public async Task<bool> StopTest(CancellationToken token)
     {
-		var process = GenProxy("long-running");
+		using var process = GenProxy("long-running");
 		if (process is null) return false;
 
 		await process.Start(token);
@@ -79,9 +79,31 @@ internal class ProcessTestVerb(
 		return true;
 	}
 
+	public async Task<bool> Steamtest(CancellationToken token)
+	{
+		string[] commands =
+		[
+			"install-steam --force",
+			"install-game -i 2857200 --validate true --os-platform windows"
+		];
+
+		foreach(var command in commands)
+		{
+			using var process = GenProxy(command);
+			if (process is null) return false;
+			await process.Start(token);
+			_logger.LogInformation("Process for command '{Command}' is running. Waiting for exit...", command);
+			await process.WaitForExit(token);
+			_logger.LogInformation("Process for command '{Command}' completed.", command);
+		}
+
+		_logger.LogInformation("Steam test completed.");
+		return true;
+	}
+
 	public async Task<bool> WriteTest(CancellationToken token)
 	{
-		var process = GenProxy("read-test");
+		using var process = GenProxy("read-test");
 		if (process is null) return false;
 
 		await process.Start(token);
@@ -104,7 +126,7 @@ internal class ProcessTestVerb(
 
     public override async Task<bool> Execute(ProcessTestOptions options, CancellationToken token)
     {
-		const string defaultMethod = nameof(NestedTest);
+		const string defaultMethod = nameof(Steamtest);
 
 		var name = options.Method?.ForceNull() ?? defaultMethod;
 		_logger.LogInformation("Executing process test method: {Method}", name);

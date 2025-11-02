@@ -53,4 +53,8 @@ public enum ProcessErrorCode
 	/// Indicates that an error occurred while trying to write to the standard input stream of the process.
 	/// </summary>
 	Write,
+	/// <summary>
+	/// Indicates that an error occurred while trying to clean up the process resources.
+	/// </summary>
+	Cleanup,
 }

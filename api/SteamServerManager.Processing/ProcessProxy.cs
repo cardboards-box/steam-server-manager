@@ -16,6 +16,7 @@ using Signaling;
 /// <para><see cref="ProcessStartInfo.RedirectStandardError"/> will always be <see langword="true"/></para>
 /// <para><see cref="ProcessStartInfo.RedirectStandardInput"/> will always be <see langword="true"/></para>
 /// <para><see cref="ProcessStartInfo.RedirectStandardOutput"/> will always be <see langword="true"/></para>
+/// <para><see cref="ProcessStartInfo.UseShellExecute"/> will always be <see langword="false"/></para>
 /// <para><see cref="ProcessStartInfo.WindowStyle"/> will always be <see cref="ProcessWindowStyle.Hidden"/></para>
 /// </remarks>
 public class ProcessProxy(
@@ -145,6 +146,10 @@ public class ProcessProxy(
 		get => _logName ??= FileName;
 		set => _logName = value;
 	}
+	/// <summary>
+	/// Whether or not the process has exited
+	/// </summary>
+	public bool HasExited => CheckHasExited();
 	#endregion
 
 	/// <summary>
@@ -152,16 +157,10 @@ public class ProcessProxy(
 	/// </summary>
 	/// <param name="command">The executable to run in the new process</param>
 	/// <param name="maxErrors">The maximum number of errors to track</param>
-	/// <param name="shellExecute">The value to use for <see cref="ProcessStartInfo.UseShellExecute"/></param>
 	public ProcessProxy(
 		string command,
-		int maxErrors = MAX_ERRORS_TRACKED,
-		bool shellExecute = false) 
-		: this(new ProcessStartInfo 
-		{ 
-			FileName = command, 
-			UseShellExecute = shellExecute
-		}, maxErrors) { }
+		int maxErrors = MAX_ERRORS_TRACKED) 
+		: this(new ProcessStartInfo { FileName = command }, maxErrors) { }
 
     #region Configuration methods
     /// <summary>
@@ -407,7 +406,7 @@ public class ProcessProxy(
 		try
 		{
 			await _accessControl.WaitAsync(token);
-			if (_process is null || _process.HasExited)
+			if (HasExited)
 				return true;
 
 			Func<bool>[] tries =
@@ -450,10 +449,10 @@ public class ProcessProxy(
 		{
 			await _accessControl.WaitAsync(token);
 
-			if (_process is null || _process.HasExited)
+			if (HasExited)
 				return true;
 
-			_process.Kill(true);
+			_process!.Kill(true);
 			return true;
 		}
 		catch (Exception ex)
@@ -477,12 +476,12 @@ public class ProcessProxy(
 	/// </remarks>
 	public async Task WaitForExit(CancellationToken token = default)
 	{
-		if (_task is null) return;
+		if (_task is null || !Running) return;
 
 		try
 		{
 			await Task.WhenAny(
-				_task,
+				_task, 
 				Task.Delay(-1, token));
 		}
 		catch (OperationCanceledException) { }
@@ -512,26 +511,37 @@ public class ProcessProxy(
 	/// <exception cref="NotSupportedException">Thrown if the signal isn't supported on the current platform</exception>
 	public bool SendSignal(Signal signal, out int code)
 	{
+		code = -1;
 		if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 		{
-			var ws = signal switch
+			WindowsSignal? ws = signal switch
 			{
 				Signal.Abort => WindowsSignal.CTRL_CLOSE_EVENT,
 				Signal.Terminate => WindowsSignal.CTRL_SHUTDOWN_EVENT,
 				Signal.Interupt => WindowsSignal.CTRL_C_EVENT,
-				_ => throw new NotSupportedException($"Signal {signal} is not supported on Windows.")
+				_ => null
 			};
-			return SendSignalWindows(ws, out code);
+
+			if (ws is not null)
+				return SendSignalWindows(ws.Value, out code);
+
+			SetError(ProcessErrorCode.Signal_NotSupported, new NotSupportedWindowsException($"Signal {signal}"));
+			return false;
 		}
 
-		var ps = signal switch
+		Signum? ps = signal switch
 		{
 			Signal.Abort => Signum.SIGABRT,
 			Signal.Terminate => Signum.SIGTERM,
 			Signal.Interupt => Signum.SIGINT,
-			_ => throw new NotSupportedException($"Signal {signal} is not supported on POSIX/UNIX.")
+			_ => null
 		};
-		return SendSignalPosix(ps, out code);
+
+		if (ps is not null)
+			return SendSignalPosix(ps.Value, out code);
+
+		SetError(ProcessErrorCode.Signal_NotSupported, new NotSupportedPosixException($"Signal {signal}"));
+		return false;
 	}
 
 	/// <summary>
@@ -546,7 +556,7 @@ public class ProcessProxy(
 	/// </remarks>
 	public bool SendSignalWindows(WindowsSignal signal, out int code)
 	{
-		if (_process is null || _process.HasExited)
+		if (HasExited)
 		{
 			code = -1;
 			SetError(ProcessErrorCode.Signal_ProcessNotRunning, new ProcessNotRunningException());
@@ -556,11 +566,11 @@ public class ProcessProxy(
 		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 		{
 			code = -1;
-			SetError(ProcessErrorCode.Signal_NotSupported, new PlatformNotSupportedException("You cannot send Windows signals on POSIX/UNIX!"));
+			SetError(ProcessErrorCode.Signal_NotSupported, new NotSupportedPosixException("Windows signals"));
 			return false;
 		}
 
-		code = WindowsConsoleCloser.SendSignal(_process, signal);
+		code = WindowsConsoleInterop.SendSignal(_process!, signal);
 		return true;
 	}
 
@@ -576,7 +586,7 @@ public class ProcessProxy(
 	/// </remarks>
 	public bool SendSignalPosix(Signum signal, out int code)
 	{
-		if (_process is null || _process.HasExited)
+		if (HasExited)
 		{
 			code = -1;
 			SetError(ProcessErrorCode.Signal_ProcessNotRunning, new ProcessNotRunningException());
@@ -586,12 +596,36 @@ public class ProcessProxy(
 		if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 		{
 			code = -1;
-			SetError(ProcessErrorCode.Signal_NotSupported, new PlatformNotSupportedException("You cannot send POSIX/UNIX signals on Windows!"));
+			SetError(ProcessErrorCode.Signal_NotSupported, new NotSupportedWindowsException("POSIX/UNIX signals"));
 			return false;
 		}
 
-		code = Syscall.kill(_process.Id, signal);
+		code = Syscall.kill(_process!.Id, signal);
 		return true;
+	}
+
+	/// <summary>
+	/// Reads all lines from the <see cref="Process.StandardOutput"/>
+	/// </summary>
+	/// <param name="token">The cancellation token for the request</param>
+	/// <returns>All of the lines read from standard output</returns>
+	public IAsyncEnumerable<string> ReadAllOutputLines(CancellationToken token = default)
+	{
+		var (channel, subs) = Channelable<string>();
+		subs.Add(OnStandardOutput.Subscribe(async t => await channel.Writer.WriteAsync(t, token)));
+		return channel.Reader.ReadAllAsync(token);
+	}
+
+	/// <summary>
+	/// Reads all lines from the <see cref="Process.StandardError"/>
+	/// </summary>
+	/// <param name="token">The cancellation token for the request</param>
+	/// <returns>All of the lines read from standard error</returns>
+	public IAsyncEnumerable<string> ReadAllErrorLines(CancellationToken token = default)
+	{
+		var (channel, subs) = Channelable<string>();
+		subs.Add(OnStandardError.Subscribe(async t => await channel.Writer.WriteAsync(t, token)));
+		return channel.Reader.ReadAllAsync(token);
 	}
 	#endregion
 
@@ -963,6 +997,23 @@ public class ProcessProxy(
 
 	#region Internal Methods
 	/// <summary>
+	/// Polyfill for <see cref="Process.HasExited"/> because microsoft (in it's infinite wisedom /s) decided 
+	/// to have it throw an error if the process hasn't started yet instead of just returning false and not
+	/// provide a way to see if the process has been run before.
+	/// </summary>
+	/// <returns>Whether or not the process has exited and isn't running</returns>
+	internal bool CheckHasExited()
+	{
+		if (!Running || _process is null) return true;
+
+		try
+		{
+			return _process.HasExited;
+		}
+		catch { return false; }
+	}
+
+	/// <summary>
 	/// Ensures the process is running before attempting to write to standard input
 	/// </summary>
 	/// <returns>
@@ -971,7 +1022,7 @@ public class ProcessProxy(
 	/// </returns>
 	internal bool EnsureWrite()
 	{
-		if (_process is not null && !_process.HasExited)
+		if (_process is not null && !HasExited)
 			return true;
 
 		SetError(ProcessErrorCode.Write, new ProcessNotRunningException());
@@ -999,6 +1050,7 @@ public class ProcessProxy(
 		startInfo.RedirectStandardOutput = true;
 		startInfo.RedirectStandardError = true;
 		startInfo.RedirectStandardInput = true;
+		startInfo.UseShellExecute = false;
 		startInfo.WindowStyle = ProcessWindowStyle.Hidden;
 	}
 
@@ -1049,7 +1101,7 @@ public class ProcessProxy(
 			}
 			catch { }
 
-			if (!_process.HasExited)
+			if (!HasExited)
 			{
 				try
 				{
@@ -1057,20 +1109,55 @@ public class ProcessProxy(
 				}
 				catch { }
 			}
+
+			int code = -1;
+			try { code = _process.ExitCode; } 
+			catch { }
+
 			Running = false;
 			_timer.Stop();
 			_exited.OnNext(new(
-				_process.ExitCode,
+				code,
 				LastError?.Exception,
 				Elapsed));
 			_process.Dispose();
 			_process = null;
+			_task = null;
 		}
 		catch (OperationCanceledException) { }
+		catch (Exception ex)
+		{
+			SetError(ProcessErrorCode.Cleanup, ex);
+		}
 		finally
 		{
 			_cleanControl.Release();
 		}
+	}
+
+	/// <summary>
+	/// Creates a threading channel that completes when the process exits
+	/// </summary>
+	/// <typeparam name="T">The type of channel</typeparam>
+	/// <param name="options">The channel options</param>
+	/// <returns>The channel and the subscriptions collection</returns>
+	internal (Channel<T> channel, List<IDisposable> subs) Channelable<T>(UnboundedChannelOptions? options = null)
+	{
+		options ??= new UnboundedChannelOptions
+		{
+			SingleReader = false,
+			SingleWriter = true,
+		};
+		var channel = Channel.CreateUnbounded<T>(options);
+		var writer = channel.Writer;
+		List<IDisposable> subs = [];
+		subs.Add(OnExited.Subscribe(_ =>
+		{
+			writer.Complete();
+			subs.ForEach(s => s.Dispose());
+			subs.Clear();
+		}));
+		return (channel, subs);
 	}
 
 	/// <inheritdoc />
@@ -1089,19 +1176,20 @@ public class ProcessProxy(
 	{
 		await CleanProcess(CancellationToken.None);
 
-		_cancel.Cancel();
-		if (_task != null)
+		if (!_cancel.IsCancellationRequested)
+			_cancel.Cancel();
+
+		if (_task is not null)
 			await _task;
 
 		_accessControl.Dispose();
 		_cleanControl.Dispose();
-		_cancel.Dispose();
 		_standardOutput.Dispose();
 		_standardError.Dispose();
 		_started.Dispose();
 		_exited.Dispose();
 		_exception.Dispose();
-		await base.DisposeAsync();
+		_cancel.Dispose();
 		GC.SuppressFinalize(this);
 	}
 	#endregion

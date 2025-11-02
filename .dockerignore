@@ -1,0 +1,9 @@
+**/.git
+**/.vs
+**/bin
+**/obj
+**/*.pdb
+**/*.suo
+**/*.user
+**/*.bak
+**/*.log
