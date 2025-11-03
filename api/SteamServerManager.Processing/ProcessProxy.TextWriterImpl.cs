@@ -16,7 +16,7 @@ public partial class ProcessProxy
 	/// </returns>
 	internal bool EnsureWrite()
 	{
-		if (_process is not null && !HasExited)
+		if (_process is not null && Running)
 			return true;
 
 		SetError(ProcessErrorCode.Write, new ProcessNotRunningException());
@@ -385,5 +385,19 @@ public partial class ProcessProxy
 	{
 		if (!EnsureWrite() || value is null) return Task.CompletedTask;
 		return Writer!.WriteLineAsync(value, cancellationToken);
+	}
+
+	/// <inheritdoc />
+	protected override void Dispose(bool disposing)
+    {
+		if (!disposing) return;
+
+		_process?.Dispose();
+		_accessControl.Dispose();
+		_standardOutput.Dispose();
+		_standardError.Dispose();
+		_started.Dispose();
+		_exited.Dispose();
+		_exception.Dispose();
 	}
 }

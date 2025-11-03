@@ -97,7 +97,7 @@ internal class ProcessService(
 			.WithStandardError(stdErr, out var errDis)
 			.WithStandardOutput(stdOut, out var outDis)
 			.Start(token);
-		var result = await proxy.WaitForResult(CancellationToken.None);
+		var result = await proxy.WaitForExit(CancellationToken.None);
 		result.Output = stdOut.ToString();
 		result.Error = stdErr.ToString();
 		outDis.Dispose();

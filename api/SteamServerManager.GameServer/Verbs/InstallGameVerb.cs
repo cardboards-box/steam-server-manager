@@ -170,7 +170,7 @@ internal class InstallGameVerb(
 			return false;
 		}
 
-		var result = await proxy.WaitForResult(token);
+		var result = await proxy.WaitForExit(token);
 		if (!result.Success)
 		{
 			_logger.LogError(result.Exception, "Failed to install game server >> {Code} in {Span}", result.ExitCode, result.Elapsed);

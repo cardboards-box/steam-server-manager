@@ -7,7 +7,7 @@ public partial class ProcessProxy
 	private readonly Subject<string> _standardOutput = new();
 	private readonly Subject<string> _standardError = new();
 	private readonly Subject<int> _started = new();
-	private readonly BehaviorSubject<ProcessResult> _exited = new(ProcessResult.Default);
+	private readonly Subject<ProcessResult> _exited = new();
 	private readonly Subject<ProcessError> _exception = new();
 
 	private IObservable<string>? _standardOutputObs;
@@ -35,7 +35,7 @@ public partial class ProcessProxy
 	/// Triggered when the process has exited
 	/// </summary>
 	/// <remarks>Since this is a <see cref="BehaviorSubject{T}"/> we need to skip the first event to ignore the default value</remarks>
-	public IObservable<ProcessResult> OnExited => _exitedObs ??= _exited.AsObservable().Skip(1);
+	public IObservable<ProcessResult> OnExited => _exitedObs ??= _exited.AsObservable();
 
 	/// <summary>
 	/// Triggered when an exception occurs during process execution

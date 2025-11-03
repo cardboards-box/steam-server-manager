@@ -19,7 +19,7 @@ using Signaling;
 /// </remarks>
 public partial class ProcessProxy(
 	ProcessStartInfo startInfo,
-	int maxErrors = ProcessProxy.MAX_ERRORS_TRACKED) : TextWriter, IAsyncDisposable, IDisposable
+	int maxErrors = ProcessProxy.MAX_ERRORS_TRACKED) : TextWriter
 {
 	#region Constants
 	/// <summary>The maximum number of errors to track by default</summary>
@@ -38,21 +38,16 @@ public partial class ProcessProxy(
 
 	#region Fields
 	private readonly Stopwatch _timer = new();
-	private readonly CancellationTokenSource _cancel = new();
 	private readonly SemaphoreSlim _accessControl = new(1, 1);
-	private readonly SemaphoreSlim _cleanControl = new(1, 1);
 	private readonly FixedQueue<ProcessError> _errors = new(maxErrors);
-
 	private Process? _process;
-	private Task? _task;
 	private Encoding? _encoding;
+	private ProcessResult? _lastResult;
 	#endregion
 
 	#region Properties
 	/// <summary>The amount of time the process has been running</summary>
 	public TimeSpan Elapsed => _timer.Elapsed;
-	/// <summary>Indicates whether or not cancellation has been requested for the process</summary>
-	public bool Cancelled => _cancel.IsCancellationRequested;
 	/// <summary>The writer to the standard input of the process</summary>
 	/// <remarks>Only available if <see cref="Running"/> is <see langword="true"/></remarks>
 	public StreamWriter? Writer => _process?.StandardInput;
@@ -62,25 +57,18 @@ public partial class ProcessProxy(
 	public ProcessError? LastError => _errors.LastOrDefault();
 	/// <summary>The last 10 errors that have occurred within the process proxy</summary>
 	public IEnumerable<ProcessError> Errors => _errors;
-	/// <summary>The result of the process at the current point in time</summary>
-	/// <remarks>If the process hasn't exited, the <see cref="ProcessResult.ExitCode"/> will be -1</remarks>
-	public ProcessResult Result => _exited.Value;
 	/// <summary>The name of the file being executed</summary>
 	public string FileName => startInfo.FileName;
 	/// <summary>The arguments being passed to the executable</summary>
 	public string Arguments => string.IsNullOrEmpty(startInfo.Arguments) ? string.Join(' ', startInfo.ArgumentList) : startInfo.Arguments;
 	/// <inheritdoc />
 	public override Encoding Encoding => _encoding ??= DefaultEncoding;
-	/// <summary>Whether or not the process has exited</summary>
-	public bool HasExited => CheckHasExited();
 	#endregion
 
 	/// <summary>Represents a proxy for managing processes</summary>
 	/// <param name="command">The executable to run in the new process</param>
 	/// <param name="maxErrors">The maximum number of errors to track</param>
-	public ProcessProxy(
-		string command,
-		int maxErrors = MAX_ERRORS_TRACKED) 
+	public ProcessProxy(string command,int maxErrors = MAX_ERRORS_TRACKED) 
 		: this(new ProcessStartInfo { FileName = command }, maxErrors) { }
 
 	#region Public Methods
@@ -92,37 +80,18 @@ public partial class ProcessProxy(
 	/// </returns>
 	public async Task<bool> Start(CancellationToken token = default)
 	{
-		var tsc = new TaskCompletionSource();
-		token.Register(() => tsc.TrySetCanceled());
 
 		try
 		{
 			await _accessControl.WaitAsync(token);
-
 			if (Running) return false;
 
-			token.Register(_cancel.Cancel);
-			Running = true;
-
-			EnsureStartArgs();
-			_process = new Process
-			{
-				StartInfo = startInfo,
-				EnableRaisingEvents = true,
-			};
-			_process.OutputDataReceived += (_, args) =>
-			{
-				if (string.IsNullOrEmpty(args.Data)) return;
-                _standardOutput.OnNext(args.Data);
-			};
-			_process.ErrorDataReceived += (_, args) =>
-			{
-				if (string.IsNullOrEmpty(args.Data)) return;
-				_standardError.OnNext(args.Data);
-			};
-
+			var tsc = new TaskCompletionSource();
+			token.Register(() => tsc.TrySetCanceled());
 			using var sub = OnStarted.Subscribe((_) => tsc.TrySetResult());
-			_task = Task.Run(ExecuteThread, CancellationToken.None);
+
+			_ = Task.Run(ExecuteThread, CancellationToken.None);
+
 			await tsc.Task;
 			return true;
 		}
@@ -155,7 +124,7 @@ public partial class ProcessProxy(
 		try
 		{
 			await _accessControl.WaitAsync(token);
-			if (HasExited) return true;
+			if (!Running) return true;
 
 			(ProcessErrorCode, Func<bool>)[] tries =
 			[
@@ -200,7 +169,7 @@ public partial class ProcessProxy(
 		try
 		{
 			await _accessControl.WaitAsync(token);
-			if (HasExited) return true;
+			if (!Running) return true;
 
 			_process!.Kill(true);
 			return true;
@@ -218,31 +187,20 @@ public partial class ProcessProxy(
 
 	/// <summary>Waits until the process is closed</summary>
 	/// <param name="token">The cancellation token for the wait operation</param>
+	/// <returns>The result of the process</returns>
 	/// <remarks>
 	/// <para>Prefer hooking <see cref="OnExited"/></para>
 	/// <para><see cref="OperationCanceledException"/> is not thrown when the <paramref name="token"/> is cancelled.</para>
 	/// </remarks>
-	public async Task WaitForExit(CancellationToken token = default)
+	public async Task<ProcessResult> WaitForExit(CancellationToken token = default)
 	{
-		if (_task is null || !Running) return;
+		if (!Running) 
+			return _lastResult ?? ProcessResult.Default;
 
-		try
-		{
-			await Task.WhenAny(_task, Task.Delay(-1, token));
-		}
-		catch (OperationCanceledException) { }
-	}
-
-	/// <summary>Waits until the process is closed and returns the result</summary>
-	/// <param name="token">The cancellation token for the wait operation</param>
-	/// <returns>The result of the process</returns>
-	/// <remarks>
-	/// <para><see cref="OperationCanceledException"/> is not thrown when the <paramref name="token"/> is cancelled.</para>
-	/// </remarks>
-	public async Task<ProcessResult> WaitForResult(CancellationToken token = default)
-	{
-		await WaitForExit(token);
-		return Result;
+		var tsc = new TaskCompletionSource<ProcessResult>();
+		token.Register(() => tsc.TrySetCanceled());
+		using var sub = OnExited.Subscribe(tsc.SetResult);
+		return await tsc.Task;
 	}
 
 	/// <summary>Sends a signal to the process based on the current platform</summary>
@@ -296,7 +254,7 @@ public partial class ProcessProxy(
 	/// </remarks>
 	public bool SendSignalWindows(WindowsSignal signal, out int code)
 	{
-		if (HasExited)
+		if (!Running)
 		{
 			code = -1;
 			SetError(ProcessErrorCode.Signal_ProcessNotRunning, new ProcessNotRunningException());
@@ -324,7 +282,7 @@ public partial class ProcessProxy(
 	/// </remarks>
 	public bool SendSignalPosix(Signum signal, out int code)
 	{
-		if (HasExited)
+		if (!Running)
 		{
 			code = -1;
 			SetError(ProcessErrorCode.Signal_ProcessNotRunning, new ProcessNotRunningException());
@@ -364,99 +322,59 @@ public partial class ProcessProxy(
 	#endregion
 
 	#region Internal Methods
-	/// <summary>
-	/// Polyfill for <see cref="Process.HasExited"/> because microsoft (in it's infinite wisedom /s) decided 
-	/// to have it throw an error if the process hasn't started yet instead of just returning false and not
-	/// provide a way to see if the process has been run before.
-	/// </summary>
-	/// <returns>Whether or not the process has exited and isn't running</returns>
-	internal bool CheckHasExited()
-	{
-		if (!Running || _process is null) return true;
-		try { return _process.HasExited; }
-		catch { return true; }
-	}
-
-	/// <summary>Ensures the required <see cref="ProcessStartInfo"/> properties are set</summary>
-	internal void EnsureStartArgs()
-	{
-		startInfo.CreateNoWindow = true;
-		startInfo.RedirectStandardOutput = true;
-		startInfo.RedirectStandardError = true;
-		startInfo.RedirectStandardInput = true;
-		startInfo.UseShellExecute = false;
-		startInfo.WindowStyle = ProcessWindowStyle.Hidden;
-	}
-
 	/// <summary>The main execution thread for the process</summary>
 	internal async Task ExecuteThread()
 	{
-		if (_process is null)
-			return;
-
+		var code = -1;
 		try
 		{
+			Running = true;
+			_lastResult = null;
+			startInfo.CreateNoWindow = true;
+			startInfo.RedirectStandardOutput = true;
+			startInfo.RedirectStandardError = true;
+			startInfo.RedirectStandardInput = true;
+			startInfo.UseShellExecute = false;
+			startInfo.WindowStyle = ProcessWindowStyle.Hidden;
+			_process = new Process 
+			{ 
+				StartInfo = startInfo, 
+				EnableRaisingEvents = true, 
+			};
+			_process.OutputDataReceived += (_, args) =>
+			{
+				if (args.Data is null) return;
+				_standardOutput.OnNext(args.Data);
+			};
+			_process.ErrorDataReceived += (_, args) =>
+			{
+				if (args.Data is null) return;
+				_standardError.OnNext(args.Data);
+			};
 			_timer.Start();
 			_process.Start();
 			_process.BeginErrorReadLine();
 			_process.BeginOutputReadLine();
 
 			_started.OnNext(_process.Id);
-			await _process.WaitForExitAsync(_cancel.Token);
+			await _process.WaitForExitAsync();
+			code = _process.ExitCode;
+
+			_process.CancelErrorRead();
+			_process.CancelOutputRead();
 		}
 		catch (OperationCanceledException) { }
 		catch (Exception ex)
 		{
 			SetError(ProcessErrorCode.RunningProcess, ex);
 		}
-		finally
-		{
-			await CleanProcess(CancellationToken.None);
-		}
-	}
 
-	/// <summary>Cleans up the resources associated with the process</summary>
-	internal async Task CleanProcess(CancellationToken token)
-	{
-		try
-		{
-			await _cleanControl.WaitAsync(token);
-
-			if (_process is null) return;
-
-			try
-			{
-				_process.CancelErrorRead();
-				_process.CancelOutputRead();
-			}
-			catch { }
-
-			if (!HasExited)
-			{
-				try { _process.Kill(true); }
-				catch { }
-			}
-
-			int code = -1;
-			try { code = _process.ExitCode; } 
-			catch { }
-
-			Running = false;
-			_timer.Stop();
-			_exited.OnNext(new(code, LastError?.Exception, Elapsed));
-			_process.Dispose();
-			_process = null;
-			_task = null;
-		}
-		catch (OperationCanceledException) { }
-		catch (Exception ex)
-		{
-			SetError(ProcessErrorCode.Cleanup, ex);
-		}
-		finally
-		{
-			_cleanControl.Release();
-		}
+		Running = false;
+		_timer.Stop();
+		_lastResult = new(code, LastError?.Exception, Elapsed);
+		_exited.OnNext(_lastResult);
+		_process?.Dispose();
+		_process = null;
 	}
 
 	/// <summary>Creates a channel that completes when the process exits</summary>
@@ -471,40 +389,14 @@ public partial class ProcessProxy(
 			SingleWriter = true,
 		};
 		var channel = Channel.CreateUnbounded<T>(options);
-		var writer = channel.Writer;
 		List<IDisposable> subs = [];
 		subs.Add(OnExited.Subscribe(_ =>
 		{
-			writer.Complete();
+			channel.Writer.Complete();
 			subs.ForEach(s => s.Dispose());
 			subs.Clear();
 		}));
 		return (channel, subs);
-	}
-
-	/// <inheritdoc />
-	public new void Dispose()
-	{
-		DisposeAsync().AsTask().GetAwaiter().GetResult();
-		GC.SuppressFinalize(this);
-	}
-
-	/// <inheritdoc />
-	public new async ValueTask DisposeAsync()
-	{
-		await CleanProcess(CancellationToken.None);
-
-		if (!_cancel.IsCancellationRequested) _cancel.Cancel();
-		if (_task is not null) await _task;
-		_accessControl.Dispose();
-		_cleanControl.Dispose();
-		_standardOutput.Dispose();
-		_standardError.Dispose();
-		_started.Dispose();
-		_exited.Dispose();
-		_exception.Dispose();
-		_cancel.Dispose();
-		GC.SuppressFinalize(this);
 	}
 	#endregion
 
